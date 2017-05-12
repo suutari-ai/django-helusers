@@ -66,6 +66,7 @@ class JWTAuthentication(JSONWebTokenAuthentication):
         changed = self.populate_user(user, payload)
         if changed:
             user.save()
+        self.update_user_groups(user, payload)
 
         ad_groups = payload.get('ad_groups', None)
         # Only update AD groups if it's a list of non-empty strings
@@ -102,29 +103,143 @@ class JWTAuthentication(JSONWebTokenAuthentication):
             raise exceptions.AuthenticationFailed(msg)
         return user
 
+    def update_user_groups(self, user, payload):
+        permissions = payload.get(JWT_PERMISSION_FIELD)
+
+        if permissions is None:
+            return None
+
+        new_api_groups = set(
+            API_GROUP_PREFIX + perm
+            for perm in permissions
+            if perm.split('.', 1)[0] == PERMISSION_PREFIX)
+        api_group_map = dict(
+            user.groups.filter(name__starstswith=API_GROUP_PREFIX)
+            .values_list('name', 'pk'))
+        current_api_groups = set(api_group_map)
+
+        if new_api_groups == current_api_groups:
+            return False
+
+        for group_to_remove in (current_api_groups - new_api_groups):
+            user.groups.remove(api_group_map[group_to_remove])
+
+        for group_to_add in (new_api_groups - current_api_groups):
+            groups = user.groups.model.objects
+            (group, created) = groups.get_or_create(name=group_to_add)
+            user.groups.add(group)
+
+        return True
+
+
 # =========================================================
 # Code copy pasted with slight modifications from apikey.py
 
+import jwkest
 import jwt
+import requests
+import six
 from jwkest import jws, jwk
 
 
-def decode_id_token(id_token):
-    jwt = jws.JWSig().unpack(id_token)
-    kid = jwt.headers['kid']
-    key = get_key(kid)
-    return jws.JWS().verify_compact(id_token, keys=[key], sigalg='RS256')
+class Error(Exception): pass  # noqa
+class InvalidJwtError(Error): pass  # noqa
+class KeyFetchFailedError(Error): pass  # noqa
+class VerificationFailedError(Error): pass  # noqa
+class ExpiredError(VerificationFailedError): pass  # noqa
+class BadSignatureError(VerificationFailedError): pass  # noqa
+class InvalidIssuerError(Error): pass  # noqa
+class InvalidAudienceError(Error): pass  # noqa
+
+
+API_GROUP_PREFIX = 'api.'
+PERMISSION_PREFIX = 'kerrokantasi'
+JWT_PERMISSION_FIELD = 'https://api.hel.fi/auth'
+OIDC_ISSUER = 'http://localhost:8000/openid'  # TODO: Move to settings
+OIDC_CLIENT_ID = 'https://api.hel.fi/auth/kerrokantasi'
+
+
+def verify_and_decode_id_token(id_token):
+    """
+    Verify an ID token and decode its contents.
+
+    The verification checks the signature against the public key of the
+    issuer and then checks that the issuer (iss) and audience (aud) of
+    the ID token are correct.
+
+    :type id_token: bytes
+    :param id_token: The ID token, encoded in JWT format
+    :rtype: dict
+    :return: Decoded payload of the ID token
+    :raises Error: if verification fails
+    """
+    parts = id_token.split(b'.')
+    import base64, json
+    decoded_parts = [
+        json.loads(base64.b64decode(part + b'====').decode('utf-8'))
+        for part in parts[0:2]]
+    #decoded_parts[0]['kid'] = 'moi'
+    parts = [
+        base64.b64encode(json.dumps(decoded_part).encode('utf-8'))
+        for decoded_part in decoded_parts] + parts[2:]
+    id_token = b'.'.join(parts)
+
+    key = get_key_from_id_token(id_token)
+
+    # Verify the ID token signature and extract the payload
+    try:
+        payload = jws.JWS().verify_compact(
+            id_token, keys=[key], sigalg='RS256')
+    except jwkest.Expired:
+        raise ExpiredError('ID token has been expired')
+    except jwkest.BadSignature:
+        raise BadSignatureError('Signature of the ID token is invalid')
+    except Exception as verify_error:
+        six.raise_from(
+            VerificationFailedError('ID token verification failed'),
+            verify_error)
+
+    # Check issuer
+    if payload['iss'] != OIDC_ISSUER:
+        raise InvalidIssuerError(
+            'Invalid issuer in ID token: {}'.format(payload['iss']))
+
+    # Check audience
+    aud = payload['aud']
+    audiences = aud if isinstance(aud, list) else [aud]
+    if OIDC_CLIENT_ID not in audiences:
+        raise InvalidAudienceError(
+            'ID token is not for us, its audience = {!r}'.format(aud))
+
+    return payload
 
 
 key_cache = {}
 
 
-def get_key(kid, jwks_url=None):
+def get_key_from_id_token(id_token):
+    try:
+        unpacked_jwt = jws.JWSig().unpack(id_token)
+    except Exception as unpack_error:
+        six.raise_from(
+            InvalidJwtError('Not a valid JWT'), unpack_error)
+    kid = unpacked_jwt.headers.get('kid')
+    if not kid:
+        raise InvalidJwtError('No key identifier (kid) in JWT.')
+    try:
+        return get_key(kid)
+    except Exception as key_fetch_error:
+        six.raise_from(
+            KeyFetchFailedError(
+                'Failed to fetch key {} from the OpenID Provider'.format(kid)),
+            key_fetch_error)
+
+
+def get_key(kid, issuer=None):
     key = key_cache.get(kid)
     if key is None:
-        if jwks_url is None:
-            # TODO: Use oidc discovery and store to settings
-            jwks_url = 'http://localhost:8000/openid/jwks'
+        endpoints = discover_oidc_endpoints(issuer)
+        jwks_url = endpoints['jwks_uri']
         for key in get_keys(jwks_url):
             if key.kid not in key_cache:
                 key_cache[key.kid] = key
@@ -132,6 +247,15 @@ def get_key(kid, jwks_url=None):
         if key is None:
             raise LookupError('Unknown key: kid=%r' % (kid,))
     return key
+
+
+def discover_oidc_endpoints(issuer=None):
+    if issuer is None:
+        issuer = OIDC_ISSUER  # TODO: Use settings
+    response = requests.get(issuer + '/.well-known/openid-configuration')
+    response.raise_for_status()
+    import pprint; pprint.pprint(response.json())
+    return response.json()
 
 
 def get_keys(jwks_url):
@@ -175,15 +299,11 @@ class OIDCAuthentication(JWTAuthentication):
 
         try:
             # Replaced original `jwt_decode_handler` with `decode_id_token`
-            payload = decode_id_token(jwt_value)
-        except jwt.ExpiredSignature:
-            msg = _('Signature has expired.')
+            payload = verify_and_decode_id_token(jwt_value)
+        except Error as error:
+            #raise
+            msg = str(error) # TODO: Translated messages?
             raise exceptions.AuthenticationFailed(msg)
-        except jwt.DecodeError:
-            msg = _('Error decoding signature.')
-            raise exceptions.AuthenticationFailed(msg)
-        except jwt.InvalidTokenError:
-            raise exceptions.AuthenticationFailed()
 
         user = self.authenticate_credentials(payload)
 

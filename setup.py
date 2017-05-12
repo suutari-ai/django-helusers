@@ -21,6 +21,8 @@ setup(
     author_email='juha.yrjola@iki.fi',
     install_requires=[
         'Django',
+        'pyjwkest',
+        'requests',
     ],
     classifiers=[
         'Environment :: Web Environment',

@@ -58,7 +58,7 @@ class UserAuthorization(object):
 
     @cached_property
     def _authorized_api_scopes(self):
-        api_scopes = self.data.get(self.settings.API_SCOPES_FIELD)
+        api_scopes = self.data.get(self.settings.API_AUTHORIZATION_FIELD)
         return (
             set(api_scopes)
             if is_list_of_non_empty_strings(api_scopes) else None)

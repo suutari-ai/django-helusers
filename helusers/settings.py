@@ -24,7 +24,7 @@ _defaults = dict(
     REQUIRE_API_SCOPE_FOR_AUTHENTICATION=False,
 
     # Field name containing the API scopes authorized by the user
-    API_SCOPES_FIELD='https://api.hel.fi/auth',
+    API_AUTHORIZATION_FIELD='https://api.hel.fi/auth',
 
     # Field name containing the AD groups of the user
     AD_GROUPS_FIELD='ad_groups', # TODO: Maybe we should use 'https://api.hel.fi/auth/ad-groups' ?
